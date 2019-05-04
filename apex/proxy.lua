@@ -12,13 +12,13 @@ local function caller() return '' end
 local M = obj.class({},'apex.proxy')
 local mt = debug.getmetatable(M)
 
-local function sort_by(t,field)
+local function sort_by(t, field)
 	table.sort(t,function(a,b)
 		return a[field] < b[field]
 	end)
 end
 
-local function table_find_remove(where,what)
+local function table_find_remove(where, what)
 	if not where then return end
 	for i,v in pairs(where) do
 		if v == what then
@@ -131,11 +131,11 @@ function M:autoload(namespace, params)
 	cf.timeout = params.timeout or self.timeout
 	cf.mode    = params.mode or self.mode or 'rw'
 	
-	
-	cf.on_call    = params.on_call or self.on_call
-	cf.request_id = params.request_id or self.request_id
-	cf.on_error   = params.on_error or self.on_error
-	cf.need_retry = params.need_retry or self.need_retry
+	cf.on_call     = params.on_call or self.on_call
+	cf.on_response = params.on_response or self.on_response
+	cf.request_id  = params.request_id or self.request_id
+	cf.on_error    = params.on_error or self.on_error
+	cf.need_retry  = params.need_retry or self.need_retry
 	
 	cf.log = params.log or self.log or function(...) self:default_log(...) end
 
@@ -177,14 +177,32 @@ function M:peer(mode)
 end
 
 local function on_call(ctx,name,...)
-	return name,ctx.mode,...
+	return name, ctx.mode, ...
 end
 
-local function do_call(self,cf,ctx,func,mode,...)
-	print(cf,ctx,func,mode,...)
-	ctx.call = cf.prefix .. func;
+local LOG_MT = {
+	__index = {
+		info = function(self, str, ...)
+			log.info("[%s]\t%s", self.reqid, tostring(str):format(...))
+		end;
+
+		warn = function(self, str, ...)
+			log.warn("[%s]\t%s", self.reqid, tostring(str):format(...))
+		end;
+
+		error = function(self, str, ...)
+			log.error("[%s]\t%s", self.reqid, tostring(str):format(...))
+		end;
+	}
+}
+
+local function build_log(reqid)
+	return setmetatable({ reqid = tostring(reqid) }, LOG_MT)
+end
+
+local function do_call(self, cf, ctx, func, mode, ...)
+	ctx.call = cf.prefix .. func
 	ctx.mode = mode or 'rw';
-	ctx.request_id = cf.request_id and cf.request_id(ctx,...)
 	local cluster = self.default
 	local modes = type(ctx.mode) == 'table' and ctx.mode or {ctx.mode}
 	local tries = #modes
@@ -195,7 +213,7 @@ local function do_call(self,cf,ctx,func,mode,...)
 		if not cluster[mode] then
 			debug = "Unknown mode for cluster "..mode
 		else
-			print("Select node for "..mode)
+			--print("Select node for "..mode)
 			node = cluster[mode]( cluster, self.waiting_timeout )
 		end
 		ctx.retry  = nil
@@ -222,7 +240,7 @@ local function do_call(self,cf,ctx,func,mode,...)
 		else
 			local r,result = pcall(function(node,timeout,...)
 				return node.conn:timeout(timeout):call(...)
-			end, node, ctx.timeout, func, ...)
+			end, node, ctx.timeout, ctx.call, ...)
 			ctx.run = clock.time()-start
 			
 			if r then
@@ -240,6 +258,8 @@ local function do_call(self,cf,ctx,func,mode,...)
 					if not cf.need_retry(ctx,result) or i == tries then
 						return unpack(result)
 					end
+				else
+					return unpack(result)
 				end
 			else
 				ctx.debug = result;
@@ -258,14 +278,16 @@ local function do_call(self,cf,ctx,func,mode,...)
 end
 
 function M:wrapped(cf, name, ...)
-	print("wrap",name,...)
+	--print("wrap",name,...)
 	local ctx = {
 		func = name;
 		mode = cf.mode or 'rw';
 		timeout = cf.timeout or self.timeout;
 	}
+	ctx.request_id = cf.request_id and cf.request_id(ctx,...)
+	ctx.log = build_log(ctx.request_id)
 	do
-	return do_call(self,cf,ctx,(cf.on_call or on_call)(ctx,...))
+	return do_call(self, cf, ctx, (cf.on_call or on_call)(ctx,...))
 	end
 	
 	local request_id = cf.request_id and cf.request_id(name,...)
