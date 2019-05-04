@@ -272,4 +272,18 @@ function M:aro(timeout)
 	return self.readonly[ math.random(#self.readonly) ] or self:rw(timeout)
 end
 
+function M:eval(cmd, timeout)
+	local results = {}
+	for k, v in pairs(self.peers) do
+		local peer_res = { pcall(function() return v.conn:timeout(timeout):eval(cmd) end) }
+		local ok = table.remove(peer_res, 1)
+		if not ok then
+			table.insert(results, setmetatable({ node = v.name, error = peer_res }, { __serialize = "map" }))
+		else
+			table.insert(results, setmetatable({ node = v.name, result = peer_res }, { __serialize = "map" }))
+		end
+	end
+	return results
+end
+
 return M
