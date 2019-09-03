@@ -1,29 +1,20 @@
 local obj = require 'obj'
 local log = require 'log'
 local fiber = require 'fiber'
+local json = require 'json'
+local sync = require 'sync'
 local reload = package.reload
 local netbox = require 'net.box'
+local val = require 'val'
+local ctx_t = require 'ctx'
 -- local caller = require 'devel.caller'
 local function caller() return '' end
-
---[[
-states:
-	error E
-	active A
-		active-ro AR
-		active-rw AW
-	offline F
-	unavail X
-
-]]
 
 local M = obj.class({},'apex.node')
 local mt = debug.getmetatable(M)
 
 local yaml = require 'yaml'
 yaml.cfg{ encode_use_tostring = true }
-
-local SILENT = false
 
 function mt:__serialize()
 	return tostring(self)
@@ -37,20 +28,173 @@ function M:__serialize()
 	return tostring(self)
 end
 
-function M:_init( t )
-	self.reconnect_interval = 0.3;
-	self.ping_interval = 0.1;
-	self.fail_count = 10;
-	self.ping_timeout = 0.5;
-	for k,v in pairs(t) do
-		self[k] = v
-	end
-	self.host  = 'unknown';
-	self.state = 'offine';
-	self._seen = {};
-	self._evs  = {};
+local STATE = {}
+for _, v in pairs({'active_ro', 'active_rw', 'inactive', 'unavail'}) do
+	STATE[string.upper(v)] = v
 end
 
+local NODE_PARAMS = {
+	addr = {
+		type = "state";
+	};
+	cluster = {
+		type = "state";
+	};
+	name = {
+		type = "state";
+	};
+	proxy_disabled = {
+		type    = "state";
+		default = false;
+	};
+	connect_timeout = {
+		type    = "dynamic";
+		default = 1;
+	};
+	timeout = {
+		type    = "dynamic";
+		default = 1;
+	};
+	reconnect_interval = {
+		type    = "dynamic";
+		default = 0.3;
+	};
+	ping_interval = {
+		type    = "dynamic";
+		default = 0.1;
+	};
+	ping_timeout = {
+		type    = "dynamic";
+		default = 0.5;
+	};
+	fail_max_count = {
+		type    = "dynamic";
+		default = 10;
+	};
+	disconnect_interval = {
+		type    = "dynamic";
+		default = 3;
+	};
+}
+
+local CHANGE_STATE_SEQ = {
+	DISCONNECT_TYPE = 'disconnect';
+};
+
+function M:get_configuration_params(args)
+	local addr = args.instance.box.remote_addr or args.instance.box.listen
+	if not addr then error("No address info in " .. args.name, 2) end
+	local params = {
+		name    = args.name;
+		cluster = args.instance.cluster;
+		addr    = addr;
+		proxy_disabled = args.instance.proxy_disabled or false;
+	}
+	if args.nodes_conf then
+		for k, v in pairs(args.nodes_conf) do
+			if not params[k] then
+				params[k] = v
+			end
+		end
+	end
+	for k, v in pairs(params) do
+		if not NODE_PARAMS[k] then
+			error(string.format("Extra argument to configure node: %s (%s)", k, v), 2)
+		end
+	end
+
+	for k, v in pairs(NODE_PARAMS) do
+		if not params[k] then
+			params[k] = v.default
+		end
+	end
+	return params
+end
+
+local init_val = val.idator({
+	name = '+string';
+	instance = val.req('table', {
+		box = val.req('table', {
+			remote_addr = '?string';
+			listen      = '?string';
+		});
+		cluster = '+string';
+		proxy_disabled = '?boolean';
+	});
+	nodes_conf = val.opt('table', {
+		connect_timeout     = val.opt(val.num);
+		timeout             = val.opt(val.num);
+		reconnect_interval  = val.opt(val.num);
+		ping_interval       = val.opt(val.num);
+		ping_timeout        = val.opt(val.num);
+		fail_max_count      = val.opt(val.num);
+		disconnect_interval = val.opt(val.num);
+	});
+})
+function M:_init(args)
+	init_val(args)
+	local params = self:get_configuration_params(args)
+	for k,v in pairs(params) do self[k] = v end
+
+	self.gen   = package.reload.count
+	self.info  = {}
+	self.host  = 'unknown'
+	self.state = STATE.INACTIVE
+	self._seen = {}
+	self._evs  = {}
+	self.ctx   = ctx_t( string.format("node:%s", self.name) )
+	self.ctx.log.store = nil
+end
+
+function M:update(args, cv)
+	init_val(args)
+	local params = M:get_configuration_params(args)
+
+	local require_state_update = false
+	for k, v in pairs(NODE_PARAMS) do
+		if v.type == 'state' and self[k] ~= params[k] then
+			self.ctx.log:warn("Try to change %s: %s -> %s. Static parameters require update with change state.",
+				k, self[k], params[k])
+			require_state_update = true
+		end
+	end
+
+	if require_state_update then
+		if params.proxy_disabled ~= self.proxy_disabled then
+			if params.proxy_disabled == true then
+				for k, _ in pairs(NODE_PARAMS) do self[k] = params[k] end
+				self:disconnect(cv)
+				self.ctx.log:info("updated with disconnect")
+			else
+				for k, _ in pairs(NODE_PARAMS) do self[k] = params[k] end
+				self:connect(cv)
+				self.ctx.log:info("updated with connect")
+			end
+		else
+			for k, _ in pairs(NODE_PARAMS) do self[k] = params[k] end
+			self:reconnect(cv)
+			self.ctx.log:info("updated with reconnect")
+		end
+	else
+		for k, v in pairs(NODE_PARAMS) do
+			if v.type == 'dynamic' and self[k] ~= params[k] then
+				self.ctx.log:info("update. Change %s: %s -> %s", k, self[k], params[k])
+				self[k] = params[k]
+			end
+		end
+		self.ctx.log:info("updated dynamically")
+	end
+end
+
+function M:get_params(param_type)
+	local res = {}
+	for k, v in pairs(NODE_PARAMS) do
+		if not param_type or param_type == v.type then
+			res[k] = self[k]
+		end
+	end
+	return res
+end
 
 function M:on(event, cb)
 	if not self._evs[event] then
@@ -86,121 +230,203 @@ function M:set_host(host)
 		self:event('host', host, old)
 	end
 end
-function M:set_state(state)
+
+function M:set_state(state, args)
+	if not args then args = {} end
+
+	local now = fiber.time()
+	if not STATE[string.upper(state)] then
+		error(string.format("unknown state %s for node %s", state, self.name))
+	end
+
+	local csts = args.change_state_seq
+	if self.change_state_seq then
+		if not csts then
+			-- self.ctx.log:info("Node in sequence %s. Impossible to change state %s -> %s",
+			-- 	self.change_state_seq.type, self.state, state)
+			return false
+		end
+		if csts.type ~= self.change_state_seq.type then
+			self.ctx.log:info("current sequence %s. Impossible to change state %s -> %s in another sequence %s",
+				self.change_state_seq.type, self.state, state, csts.type)
+			return false
+		end
+		if csts.finish then
+			self.ctx.log:info("finish sequence %s", self.change_state_seq.type)
+			self.change_state_seq = nil
+		end
+	elseif csts then
+		self.change_state_seq = csts
+		self.ctx.log:info("start sequence %s", self.change_state_seq.type)
+	end
+
 	local old = self.state
 	self.state = state
 	if old ~= state then
-		self:event('state',state,old)
-		if state:match('error') then
-			log.info("[ALERT] %s/%s: %s -> %s  at %s",
-				self.addr, self.info.host, old, state, caller(1))
+		self.state_mtime = now
+		self:event('state', state, old)
+		if state == STATE.UNAVAIL or state == STATE.INACTIVE then
+			self.ctx.log:info("%s -> %s at %s", old, state, caller(1))
 		else
-			log.info("%s/%s: %s -> %s  at %s",
-				self.addr, self.info.host, old, state, caller(1))
+			self.ctx.log:info("%s -> %s at %s", old, state, caller(1))
 		end
 	end
+	return true
 end
 
 function M:describe()
 	return string.format("%s/%s:%s", self.addr, self.info and self.info.host, self.state)
 end
 
+function M:disconnect(cv)
+	if self.change_state_seq and self.change_state_seq.type == CHANGE_STATE_SEQ.DISCONNECT_TYPE then
+		self.ctx.log:info("node already try to disconnect. Ignore with function")
+		return
+	end
+
+	if cv then cv:start() end
+	self:set_state( STATE.UNAVAIL, { change_state_seq = {
+		type = CHANGE_STATE_SEQ.DISCONNECT_TYPE;
+		start = fiber.time();
+	}} )
+
+	local disconnect_time = fiber.time() + self.disconnect_interval
+
+	if self.state_mtime > disconnect_time then
+		self:set_state( STATE.INACTIVE, { change_state_seq = {
+			type = CHANGE_STATE_SEQ.DISCONNECT_TYPE;
+			finish = fiber.time();
+		}} )
+		self.conn:close()
+		if cv then
+			local ok, r = pcall(function() cv:finish() end)
+			if not ok then
+				self.ctx.log:error("Error in finish cv in node disconnect. Count=%d", cv.count)
+			end
+			cv = nil
+		end
+	else
+		fiber.create(function()
+			fiber.sleep(disconnect_time - self.state_mtime)
+			if package.reload.count == self.gen then
+				self:set_state( STATE.INACTIVE, { change_state_seq = {
+					type = CHANGE_STATE_SEQ.DISCONNECT_TYPE;
+					finish = fiber.time();
+				}} )
+				self.conn:close()
+			end
+			if cv then
+				local ok, r = pcall(function() cv:finish() end)
+				if not ok then
+					self.ctx.log:error("Error in finish cv in node disconnect (in waiting fiber). Count=%d", cv.count)
+				end
+				cv = nil
+			end
+		end)
+	end
+end
+
+function M:reconnect(cv)
+	if cv then cv:start() end
+
+	local reconnect_cv = sync.cv()
+	self:disconnect(reconnect_cv)
+	self:connect(reconnect_cv)
+	reconnect_cv:wait()
+
+	if cv then
+		local ok, r = pcall(function() cv:finish() end)
+		if not ok then
+			self.ctx.log:error("Error in finish cv in node reconnect. Count=%d", cv.count)
+		end
+		cv = nil
+	end
+end
+
 function M:connect(cv)
+	if self.proxy_disabled == true then
+		self.ctx.log:info("node was disabled")
+		return
+	end
 	self.fiber = fiber.create(function()
-		-- cv:start()
-		-- fiber.sleep(0.01)
-		local mygen = reload.count
-		fiber.name(string.sub(string.format('%s#%s:%s',mygen,self.name,self.addr),1,32))
-		
-		local warn = log.warn
-		local warned = false
-		while reload.count == mygen do
-			local r,e = pcall(function()
+		cv:start()
+		fiber.sleep(0.01)
+		fiber.name( string.sub(string.format('%s:cluster_node', self.gen), 1, 32) )
+
+		while package.reload.count == self.gen do
+			local r, e = pcall(function()
 				self.conn = netbox.new(self.addr, {
-					wait_connected = false,
-					connect_timeout = 1, -- TODO
-					timeout = 1,
-					call_16 = true,
+					wait_connected  = false,
+					connect_timeout = self.connect_timeout;
+					timeout         = self.timeout;
+					call_16         = true,
 				})
-				if getmetatable( self.conn ) and not rawget( getmetatable( self.conn ), "__serialize" ) then
-					rawset( getmetatable( self.conn ), "__serialize", function(c)
-						return string.format("%s:%s [%s] (%s)",c.host,c.port,c.state,c.error)
-					end )
-				end
-				self.info = { rw = nil }
 
-				if SILENT then
-					log.warn = function() end
-				end
-
-				repeat
-					local state = self.conn:wait_connected(1)
-					state = self.conn.state
-					if state == 'active' then break end
-					if state == 'handshake' then
-						state = 'error'
-						self.conn.error = 'Connection timed out'
-					end
-					if self.state ~= state then
-						log.error("Failed to connect to %s: (%s) %s", self.addr, self.conn.state, self.conn.error)
-					end
-					self:set_state(state)
-					if cv then cv:finish() cv = nil end
-					fiber.sleep(self.reconnect_interval)
-				until true
-
-				if SILENT then
-					log.warn = warn
-				end
+				self.info = {}
+				self.conn:wait_connected(1)
 
 				if self.conn.state ~= 'active' then
-					if not warned then
-						log.info("Node %s: %s", self.addr, self.conn.error)
-						warned = true
+					if cv then
+						local ok, r = pcall(function() cv:finish() end)
+						if not ok then
+							self.ctx.log:error("Error in finish cv in node connect (in case with not active conn state). Count=%d", cv.count)
+						end
+						cv = nil
 					end
-				else -- if self.conn.state == 'active' then
-					warned = false
-					local info
+					fiber.sleep(self.reconnect_interval)
+				else
 					local failcount = 0
-					while self.conn.state == 'active' and mygen == reload.count do
-						local r,info = pcall(function() return self.conn:timeout(self.ping_timeout):call('kit.node') end)
+					while self.conn.state == 'active' and self.gen == package.reload.count do
+						local state = self.state
+						local r, info = pcall(function() return self.conn:timeout(self.ping_timeout):call('kit.node', {}) end)
 						if r and info then
 							failcount = 0
-							local vinfo = info[1][1]
-							if not self.info.id then
-								log.info("Node %s/%s connected with rw %s", self.addr, vinfo.hostname, vinfo.rw)
-							end
-							self.info = vinfo
-							self.info.host = (self.info.hostname:match('^([^.]+)'))
+							self.info = info[1][1]
+							self.info.host = ( self.info.hostname:match('^([^.]+)') )
 							self:set_host(self.info.host)
-							self:set_state('active-' .. ( vinfo.rw and "rw" or "ro" ))
+							if self.info.rw then
+								self:set_state( STATE.ACTIVE_RW )
+							else
+								self:set_state( STATE.ACTIVE_RO )
+							end
 						else
-							log.info("Node %s kit.node call failed: %s", self.addr, info)
-							self:set_state('unavail')
-							failcount = failcount + 1
-							if failcount > self.fail_count then
-								log.info("Node %s closing because of fails", self.addr)
-								self.conn:close()
+							if not self.change_state_seq or self.change_state_seq.type ~= CHANGE_STATE_SEQ.DISCONNECT_TYPE then
+								self.ctx.log:info("kit.node call failed: %s", info)
+								self:set_state( STATE.UNAVAIL )
+								failcount = failcount + 1
+								if failcount > self.fail_max_count then
+									self.ctx.log:info("node closing because of fails = %s", failcount)
+									self:disconnect()
+								end
 							end
 						end
-						
-						if cv then cv:finish() cv = nil end
+
+						if cv then
+							local ok, r = pcall(function() cv:finish() end)
+							if not ok then
+								self.ctx.log:error("Error in finish cv in node connect (in case with ping connection). Count=%d", cv.count)
+							end
+							cv = nil
+						end
 						fiber.sleep(self.ping_interval)
 					end
 
 					self.info.rw = nil
-					self.error = self.conn.error
-					self:set_state(self.conn.state)
-
-					log.info("Node %s/%s disconnected: (%s) %s", self.addr, self.host, self.conn.state, self.conn.error)
+					self:set_state( STATE.INACTIVE )
+					self.ctx.log:info("node disconnected. Conn: (%s) %s. PackageGen (%s/%s)",
+						self.conn.state, self.conn.error, self.gen, package.reload.count)
 				end
 			end)
 			if not r then
-				log.error("Fiber failed: %s", e)
+				self.ctx.log:info("fiber failed: %s", e)
 				fiber.sleep(0.01)
 			end
+			if self.proxy_disabled == true then
+				self.ctx.log:info("node was disabled")
+				break
+			end
 		end
-		log.info("Obsoleted")
+		self.ctx.log:info("obsoleted")
 	end)
 end
 
