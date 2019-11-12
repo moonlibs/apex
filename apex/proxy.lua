@@ -30,6 +30,9 @@ local proxy_validation_scheme = {
 		ping_timeout       = val.opt(val.num);
 		fail_max_count     = val.opt(val.num);
 	});
+	cluster_conf = val.opt("table", {
+		failing_timeout = val.opt(val.num);
+	});
 	waiting_timeout = val.opt(val.num);
 }
 
@@ -75,11 +78,17 @@ function M:_get_cluster_params(args)
 			end
 		end
 	end
-	return {
+	local res = {
 		name = cluster_name;
 		upstream = args.upstream;
 		nodes_conf = args.nodes_conf;
 	}
+	if args.cluster_conf then
+		for k, v in pairs(args.cluster_conf) do
+			if not res[k] then res[k] = v end
+		end
+	end
+	return res
 end
 
 local proxy_val = val.idator(proxy_validation_scheme)

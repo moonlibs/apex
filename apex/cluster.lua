@@ -64,12 +64,14 @@ local init_val = val.idator({
 		ping_timeout       = val.opt(val.num);
 		fail_max_count     = val.opt(val.num);
 	});
+	failing_timeout = val.opt(val.num);
 })
 function M:_init(t)
 	init_val(t)
 
 	self.name = t.name
 	self.upstream = t.upstream
+	self.failing_timeout = t.failing_timeout or 3
 
 	self.state       = STATE.OFFLINE
 	self.nodes       = {}
@@ -196,6 +198,8 @@ function M:working_state(nodes)
 	self.state = STATE.WORKING
 	self.ok = true
 	self.since = fiber.time()
+	self.failing_reason = nil
+	self.waiting_reason = nil
 	for ch in pairs(self.waits) do
 		ch:put(true)
 	end
@@ -206,15 +210,46 @@ function M:waiting_state(reason)
 	self.state = STATE.WAITING
 	self.ok    = false
 	self.since = fiber.time()
+	self.waiting_reason = reason
 	self.readwrite = nil
 	if self.gen == package.reload.count then
-		fiber.create(function()
-			fiber.name( string.sub(string.format('%s#%s:fib', package.reload.count, self.name), 1, 32) )
-			fiber.sleep(1)
-			if self.state == STATE.WAITING then
-				self:failing_state(reason)
-			end
+		if self.failing_fiber and self.failing_fiber:status() ~= "dead" then
+			self.ctx.log:info("not start failing fiber - its already exist. Id=%s. Status=%s",
+				self.failing_fiber:id(), self.failing_fiber:status()
+			)
+			return
+		end
+		self.failing_fiber = fiber.create(function()
+			fiber.name( string.sub(string.format('failing_fb:%s:%s:%s', self.name, package.reload.count, fiber.self().id()), 1, 32) )
+			repeat
+				if package.reload.count ~= self.gen then
+					self.ctx.log:info("finish failing_fiber - change gen")
+					break
+				end
+				if self.state ~= STATE.WAITING then
+					self.ctx.log:info("not call failing_state in failing_fiber. Cluster is %s", self.state)
+					break
+				end
+
+				local fail_at = math.floor(self.since) + self.failing_timeout
+				local now = math.floor(fiber.time())
+
+				if fail_at <= now then
+					self:failing_state(self.waiting_reason)
+					break
+				end
+				local diff = fail_at - now
+				self.ctx.log:info("call failing_state at %s after %s sec",
+					fail_at, diff
+				)
+				fiber.sleep(diff)
+			until false
+			self.ctx.log:info("finished failing fiber id=%s", self.failing_fiber:id())
+			self.failing_fiber = nil
 		end)
+		self.ctx.log:info("started failing fiber id=%s", self.failing_fiber:id())
+	else
+		self.ctx.log:info("not start failing fiber - change gen")
 	end
 end
 
@@ -223,6 +258,7 @@ function M:failing_state(reason)
 	self.state = STATE.FAILING
 	self.ok = false
 	self.since = fiber.time()
+	self.failing_reason = reason
 	self.readwrite = nil
 	for ch in pairs(self.waits) do
 		ch:put(false)
@@ -255,19 +291,14 @@ function M:connect(startup_cv)
 				)
 
 				self.readonly  = nodes.list.readonly
-				if #nodes.list.readwrite == 1 then
-					if self.readwrite and self.readwrite.addr == nodes.list.readwrite[1].addr then
-						self.ctx.log:info("state change doesn't affect current primary %s", self.readwrite.addr)
-					else
+				if self.readwrite and self.readwrite.info.rw then
+					self.ctx.log:info("state change doesn't affect current primary %s", self.readwrite.addr)
+				else
+					if #nodes.list.readwrite == 1 then
 						self.readwrite = nodes.list.readwrite[1]
 						self:working_state(nodes)
-					end
-				else
-					local message = string.format("readwrite nodes count=%s", #nodes.list.readwrite)
-					if self.state ~= STATE.WAITING then
-						self:waiting_state(message)
 					else
-						self:failing_state(message)
+						self:waiting_state(string.format("Count of readwrite nodes=%s", #nodes.list.readwrite))
 					end
 				end
 

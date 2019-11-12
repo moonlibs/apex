@@ -71,6 +71,10 @@ local NODE_PARAMS = {
 		type    = "dynamic";
 		default = 10;
 	};
+	fail_count_printed = {
+		type    = "dynamic";
+		default = 1;
+	};
 	disconnect_interval = {
 		type    = "dynamic";
 		default = 3;
@@ -264,6 +268,9 @@ function M:set_state(state, args)
 	self.state = state
 	if old ~= state then
 		self.state_mtime = now
+		if state == STATE.INACTIVE then
+			self.info.rw = nil
+		end
 		self:event('state', state, old)
 		if state == STATE.UNAVAIL or state == STATE.INACTIVE then
 			self.ctx.log:info("%s -> %s at %s", old, state, caller(1))
@@ -391,7 +398,9 @@ function M:connect(cv)
 							end
 						else
 							if not self.change_state_seq or self.change_state_seq.type ~= CHANGE_STATE_SEQ.DISCONNECT_TYPE then
-								self.ctx.log:info("kit.node call failed: %s", info)
+								if failcount < self.fail_count_printed then
+									self.ctx.log:info("kit.node call failed: %s", info)
+								end
 								self:set_state( STATE.UNAVAIL )
 								failcount = failcount + 1
 								if failcount > self.fail_max_count then
@@ -411,7 +420,6 @@ function M:connect(cv)
 						fiber.sleep(self.ping_interval)
 					end
 
-					self.info.rw = nil
 					self:set_state( STATE.INACTIVE )
 					self.ctx.log:info("node disconnected. Conn: (%s) %s. PackageGen (%s/%s)",
 						self.conn.state, self.conn.error, self.gen, package.reload.count)
